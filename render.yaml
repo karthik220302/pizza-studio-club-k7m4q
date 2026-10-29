@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: pizza-studio-club-demo-k7m4q
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DEMO_MODE
+        value: "true"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: STAFF_PIN
+        generateValue: true

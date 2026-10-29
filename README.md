@@ -1,5 +1,7 @@
-# Pizza Studio Club public preview
+# Pizza Studio Club
 
-This repository contains the static, public concept preview. It shows the design and menu. Bookings, payments, invitations, QR check-in and receipts require the original FastAPI/SQLite backend and are unavailable here.
+The repository root is the static concept preview published by GitHub Pages. The `backend/` folder contains the FastAPI app with bookings, group orders, simulated payments, invitation links, QR check-in, and PDF receipts.
 
-To publish with GitHub Pages, set Pages source to **Deploy from a branch**, choose **main** and **/(root)**. No build step is required.
+The `render.yaml` Blueprint deploys the backend on Render's free Python plan. It generates separate server and staff secrets. The backend uses temporary SQLite storage on that plan, so bookings can disappear when the service restarts or redeploys. It is a public classroom demo, not a reservation system for real customers. Payments are simulated and do not charge a card.
+
+Run the backend locally from `backend/` with `pip install -r requirements.txt` and `uvicorn app.server:app --host 127.0.0.1 --port 8000`. The public deployment reads its base URL from Render's `RENDER_EXTERNAL_URL` variable.

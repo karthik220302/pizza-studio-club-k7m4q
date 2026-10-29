@@ -1,0 +1,6 @@
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+pydantic>=2,<3
+reportlab>=4,<5
+qrcode[pil]>=7.4,<9
+requests>=2.31,<3
