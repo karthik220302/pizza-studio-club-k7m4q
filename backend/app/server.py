@@ -5,10 +5,11 @@ Set DEMO_MODE=false, SECRET_KEY, STAFF_PIN and STRIPE_SECRET_KEY for payment int
 No card data are collected or stored by this application.
 """
 from __future__ import annotations
-import base64, datetime as dt, hashlib, hmac, io, json, os, re, secrets, sqlite3, time, urllib.parse
+import base64, datetime as dt, hashlib, hmac, io, json, os, re, secrets, shutil, sqlite3, time, urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 import qrcode
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -268,6 +269,18 @@ def join(bid:str,req:Join):
 def get_book(bid:str,authorization:Optional[str]=Header(None)):
  auth(bid,authorization)
  with conn() as c:return public_view(c,bid)
+@app.delete('/api/bookings/{bid}')
+def delete_past_booking(bid:str,authorization:Optional[str]=Header(None)):
+ who=auth(bid,authorization);organizer(who)
+ with transaction() as c:
+  b=booking(c,bid)
+  end=dt.datetime.fromisoformat(f"{b['date']}T{b['end']}").replace(tzinfo=ZoneInfo('Europe/Paris'))
+  if end>=dt.datetime.now(ZoneInfo('Europe/Paris')):
+   fail(409,'This booking can be deleted after its session has ended.')
+  c.execute('DELETE FROM bookings WHERE id=?',(bid,))
+ if re.fullmatch(r'PSC-[A-F0-9]{10}',bid):
+  shutil.rmtree(ROOT.parent/'private_invoices'/bid,ignore_errors=True)
+ return {'deleted':True,'booking_id':bid}
 @app.post('/api/bookings/{bid}/guest-count')
 def set_guest_count(bid:str,req:GuestPlan,authorization:Optional[str]=Header(None)):
  who=auth(bid,authorization);organizer(who)
