@@ -8,7 +8,7 @@ from __future__ import annotations
 import base64, datetime as dt, hashlib, hmac, io, json, os, re, secrets, shutil, sqlite3, time, urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from zoneinfo import ZoneInfo
 import qrcode
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -38,6 +38,11 @@ LOYALTY=1400
 ROOM_FEE=1200
 CAPACITY=8
 ROOM_COUNT=6
+MAX_CAPACITY=16
+COMBINED_ROOMS=((1,2),(3,4))
+DUO_PRICE=2200
+LOYAL_DUO_PRICE=1400
+EXTRA_FOOD_PRICE=1200
 HOLD_MINS=45
 MENU=[
   ('pizza_margherita','Margherita Pizza','Pizza','Tomato, mozzarella & basil',1190,'🍕'),
@@ -98,6 +103,7 @@ def init_db():
  amount_cents INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'unpaid',provider_session TEXT,
  paid_at TEXT,method TEXT, UNIQUE(booking_id,member_id), FOREIGN KEY(booking_id) REFERENCES bookings(id) ON DELETE CASCADE);
  CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,created_at TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS loyalty_rewards(code_hash TEXT PRIMARY KEY,issued_at TEXT NOT NULL,redeemed_at TEXT,booking_id TEXT,member_id TEXT);
  CREATE INDEX IF NOT EXISTS idx_rooms ON bookings(date,start,end,room,status);
  CREATE INDEX IF NOT EXISTS idx_members_booking ON members(booking_id);
  ''')
@@ -105,18 +111,24 @@ def init_db():
   cols={row['name'] for row in c.execute('PRAGMA table_info(bookings)')}
   if 'expected_guests' not in cols:
    c.execute('ALTER TABLE bookings ADD COLUMN expected_guests INTEGER NOT NULL DEFAULT 8')
+  cols.add('expected_guests')
+  for col,definition in (
+   ('requested_room2','INTEGER'),('room2','INTEGER'),
+   ('pricing_version','INTEGER NOT NULL DEFAULT 1'),
+   ('extra_food_packages','INTEGER NOT NULL DEFAULT 0')):
+   if col not in cols:c.execute(f'ALTER TABLE bookings ADD COLUMN {col} {definition}')
 init_db()
 
 class NewBooking(BaseModel):
- date:str;time:str;name:str=Field(min_length=1,max_length=80);email:str='';requested_room:Optional[int]=Field(None,ge=1,le=6);loyal:bool=False;expected_guests:int=Field(2,ge=1,le=8)
+ date:str;time:str;name:str=Field(min_length=1,max_length=80);email:str='';requested_room:Optional[Union[int,str]]=None;loyal:bool=False;reward_code:str='';expected_guests:int=Field(2,ge=1,le=16);extra_food_packages:int=Field(0,ge=0,le=8)
 class Join(BaseModel):
- invite:str;name:str=Field(min_length=1,max_length=80);email:str='';loyal:bool=False
+ invite:str;name:str=Field(min_length=1,max_length=80);email:str='';loyal:bool=False;reward_code:str=''
 class AddItem(BaseModel):
  product_id:str;qty:int=Field(1,ge=1,le=20);shared:bool=False
 class UpdateQty(BaseModel):qty:int=Field(ge=0,le=20)
 class Split(BaseModel):mode:str;custom:dict[str,int]={};payer_id:Optional[str]=None
-class Room(BaseModel):room:Optional[int]=Field(None,ge=1,le=6)
-class GuestPlan(BaseModel):expected_guests:int=Field(ge=1,le=8)
+class Room(BaseModel):room:Optional[Union[int,str]]=None
+class GuestPlan(BaseModel):expected_guests:int=Field(ge=1,le=16)
 class Payment(BaseModel):idempotency_key:str=Field(min_length=3,max_length=100)
 class StaffVerification(BaseModel):token:str
 
@@ -130,12 +142,29 @@ def parse_date_time(d,t):
  if begin.time()<dt.time(10,0) or (begin+dt.timedelta(minutes=SESSION_MINS)).time()>dt.time(21,0):fail(422,'Choose a 90-minute slot between 10:00 and 21:00 (last start 19:30).')
  return begin,(begin+dt.timedelta(minutes=SESSION_MINS)).strftime('%H:%M')
 
-def available(c,date,start,end,exclude=None):
+def room_key(room,room2=None):return f'{room}+{room2}' if room2 else room
+def room_name(room,room2=None):return f'Combined Studio {room} + {room2}' if room2 else f'Studio {room}'
+def normalize_room(value,guests):
+ if value is None:return (None,None)
+ if guests<=8:
+  if isinstance(value,bool) or str(value) not in {str(x) for x in range(1,7)}:fail(422,'Choose an individual room from 1 to 6.')
+  return (int(value),None)
+ if str(value) not in ('1+2','3+4'):fail(422,'Choose Combined Studio 1 + 2 or 3 + 4 for 9–16 guests.')
+ a,b=map(int,str(value).split('+'));return a,b
+
+def redeem_reward(c,code,bid,mid):
+ if not code:fail(422,'Enter a one-time 10-stamp reward code.')
+ result=c.execute('UPDATE loyalty_rewards SET redeemed_at=?,booking_id=?,member_id=? WHERE code_hash=? AND redeemed_at IS NULL',
+  (stamp(),bid,mid,hsh(code.strip())))
+ if result.rowcount!=1:fail(409,'This 10-stamp reward code is invalid or has already been redeemed.')
+
+def available(c,date,start,end,guests=2,exclude=None):
  # An incomplete group holds its assigned room only while the hold is valid.
- rows=c.execute('''SELECT room FROM bookings WHERE date=? AND room IS NOT NULL AND start < ? AND end > ?
+ rows=c.execute('''SELECT room,room2 FROM bookings WHERE date=? AND room IS NOT NULL AND start < ? AND end > ?
  AND (status='confirmed' OR (status='held' AND hold_until > ?)) AND id<>?''',
  (date,end,start,stamp(),exclude or '')).fetchall()
- taken={r['room'] for r in rows}
+ taken={n for r in rows for n in (r['room'],r['room2']) if n is not None}
+ if guests>8:return [f'{a}+{b}' for a,b in COMBINED_ROOMS if a not in taken and b not in taken]
  return [r for r in range(1,ROOM_COUNT+1) if r not in taken]
 
 def auth(bid, authorization):
@@ -164,9 +193,34 @@ def rows_for(c,bid):
  charges=[dict(r) for r in c.execute('SELECT id,member_id,amount_cents,status,paid_at,method FROM charges WHERE booking_id=?',(bid,))]
  return m,order,charges
 
+def menu_charges(members,items,pricing_version):
+ result={item['id']:{'included_qty':0,'billable_qty':item['qty'],'billable_cents':item['qty']*item['unit_cents']} for item in items}
+ if pricing_version<2:return result
+ allowance=2*((len(members)+1)//2)
+ for category in ('Pizza','Drinks'):
+  remaining=allowance
+  eligible=sorted((item for item in items if MENUD.get(item['product_id'],{}).get('category')==category),key=lambda item:(-item['unit_cents'],item['id']))
+  for item in eligible:
+   included=min(remaining,item['qty']);remaining-=included
+   result[item['id']]={'included_qty':included,'billable_qty':item['qty']-included,'billable_cents':(item['qty']-included)*item['unit_cents']}
+ return result
+
 def calc_bill(b, members, items):
  n=len(members)
  if not n:fail(409,'At least one guest is required.')
+ if b['pricing_version']>=2:
+  packages=[members[i:i+2] for i in range(0,n,2)]
+  discounted=sum(any(m['loyal'] for m in pair) for pair in packages)
+  duo_total=(len(packages)-discounted)*DUO_PRICE+discounted*LOYAL_DUO_PRICE
+  extras=b['extra_food_packages']*EXTRA_FOOD_PRICE
+  foods=sum(x['billable_cents'] for x in menu_charges(members,items,2).values())
+  total=duo_total+extras+foods
+  tax=round(total*VAT_PCT/(100+VAT_PCT))
+  return {'pricing_version':2,'duo_package_count':len(packages),'loyal_duo_package_count':discounted,
+   'duo_total_cents':duo_total,'extra_food_package_count':b['extra_food_packages'],
+   'extra_food_cents':extras,'food_cents':foods,'room_fee_cents':0,'seat_total_cents':0,
+   'total_cents':total,'tax_cents':tax,'before_tax_cents':total-tax,
+   'loyalty_savings_cents':discounted*(DUO_PRICE-LOYAL_DUO_PRICE)}
  # Each participant books a studio seat and receives a personal loyalty saving.
  seat={m['id']:(LOYALTY if m['loyal'] else BASE) for m in members}
  seat_total=sum(seat.values())
@@ -198,6 +252,22 @@ def allocations(b, members, items, bill, split):
   if any(not isinstance(a,int) or a<0 for a in split.custom.values()):fail(422,'Amounts must be nonnegative whole cents.')
   if sum(split.custom.values())!=bill['total_cents']:fail(422,'Custom split amounts must exactly equal the total.')
   return split.custom
+ if b['pricing_version']>=2:
+  amount={m['id']:0 for m in members}
+  item_costs=menu_charges(members,items,2)
+  for i in range(0,n,2):
+   pair=members[i:i+2];cost=LOYAL_DUO_PRICE if any(m['loyal'] for m in pair) else DUO_PRICE
+   for mid,share in distribute(cost,[m['id'] for m in pair]).items():amount[mid]+=share
+  for mid,share in distribute(bill['extra_food_cents'],ids).items():amount[mid]+=share
+  for item in items:
+   sub=item_costs[item['id']]['billable_cents']
+   if item['shared']:
+    for mid,share in distribute(sub,ids).items():amount[mid]+=share
+   else:
+    if item['member_id'] not in ids:fail(422,'One menu item has an invalid owner.')
+    amount[item['member_id']]+=sub
+  if sum(amount.values())!=bill['total_cents']:fail(500,'Bill allocation did not balance.')
+  return amount
  amount={m['id']:LOYALTY if m['loyal'] else BASE for m in members}
  fee=distribute(bill['room_fee_cents'],ids)
  for i in ids:amount[i]+=fee[i]
@@ -214,6 +284,10 @@ def allocations(b, members, items, bill, split):
 
 def public_view(c,bid):
  b=dict(booking(c,bid));m,order,ch=rows_for(c,bid);bill=calc_bill(b,m,order)
+ item_costs=menu_charges(m,order,b['pricing_version'])
+ for item in order:item.update(item_costs[item['id']])
+ b['room_name']=room_name(b['room'],b['room2']) if b['room'] else None
+ b['room_key']=room_key(b['room'],b['room2']) if b['room'] else None
  # Emails not returned in shared group view; just member first names.
  for x in m:x.pop('email',None)
  return {'booking':{k:v for k,v in b.items() if k!='invite_hash'},'members':m,'items':order,'charges':ch,'bill':bill,'demo_mode':DEMO}
@@ -225,33 +299,48 @@ def health():
  with conn() as c:c.execute('SELECT 1').fetchone()
  return {'status':'ok'}
 @app.get('/api/config')
-def config():return {'demo_mode':DEMO,'restaurant':STUDIO_NAME,'hours':'10:00–21:00','duration_minutes':SESSION_MINS,'room_count':ROOM_COUNT,'capacity':CAPACITY,'menu':list(MENUD.values()),'seat_regular_cents':BASE,'seat_loyal_cents':LOYALTY,'room_fee_cents':ROOM_FEE,'tax_percent_illustrative':VAT_PCT,'stripe_enabled':bool(STRIPE_KEY)}
+def config():return {'demo_mode':DEMO,'restaurant':STUDIO_NAME,'hours':'10:00–21:00','duration_minutes':SESSION_MINS,'room_count':ROOM_COUNT,'capacity':MAX_CAPACITY,'combined_rooms':['1+2','3+4'],'duo_price_cents':DUO_PRICE,'loyal_duo_price_cents':LOYAL_DUO_PRICE,'extra_food_price_cents':EXTRA_FOOD_PRICE,'menu':list(MENUD.values()),'tax_percent_illustrative':VAT_PCT,'stripe_enabled':bool(STRIPE_KEY)}
 @app.get('/api/availability')
-def slots(date:str,requested_room:Optional[int]=None):
- try:dt.date.fromisoformat(date)
+def slots(date:str,guests:int=2,requested_room:Optional[Union[int,str]]=None):
+ try:day=dt.date.fromisoformat(date)
  except:fail(422,'Invalid date.')
- data=[]
- with conn() as c:
+ if not 1<=guests<=MAX_CAPACITY:fail(422,'Choose 1 to 16 guests.')
+ preferred=normalize_room(requested_room,guests) if requested_room is not None else None
+ key=room_key(*preferred) if preferred else None
+ def day_slots(c,day):
+  result=[]
   for hh in range(10,20):
    for minute in (0,30):
     t=f'{hh:02d}:{minute:02d}'
-    try:_,end=parse_date_time(date,t)
+    try:_,end=parse_date_time(day.isoformat(),t)
     except HTTPException:continue
-    rooms=available(c,date,t,end)
-    if requested_room:rooms=[r for r in rooms if r==requested_room]
-    if rooms:data.append({'start':t,'end':end,'free_rooms':len(rooms),'rooms':rooms})
- return {'date':date,'slots':data}
+    rooms=available(c,day.isoformat(),t,end,guests)
+    if key is not None:rooms=[r for r in rooms if r==key]
+    if rooms:result.append({'start':t,'end':end,'free_rooms':len(rooms),'rooms':rooms})
+  return result
+ with conn() as c:
+  data=day_slots(c,day)
+  suggestions=[]
+  if not data:
+   for offset in range(1,8):
+    other=day+dt.timedelta(days=offset)
+    for slot in day_slots(c,other)[:2]:
+     suggestions.append({'date':other.isoformat(),**slot})
+    if len(suggestions)>=4:break
+ return {'date':date,'guests':guests,'slots':data,'suggestions':suggestions[:4]}
 @app.post('/api/bookings')
 def create(req:NewBooking):
  _,end=parse_date_time(req.date,req.time)
+ preferred,preferred2=normalize_room(req.requested_room,req.expected_guests)
  if req.loyal and not DEMO:fail(403,'A loyalty reward requires verified stamps from a connected loyalty account.')
  if req.email and ('@' not in req.email or len(req.email)>150):fail(422,'Please enter a valid email.')
  bid=uid('PSC');member_id=uid('G');token=secrets.token_urlsafe(32);invite=secrets.token_urlsafe(32)
  with transaction() as c:
-  c.execute('INSERT INTO bookings(id,date,start,end,requested_room,status,invite_hash,organizer_id,loyal_organizer,expected_guests,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
- (bid,req.date,req.time,end,req.requested_room,'planning',hsh(invite),member_id,int(req.loyal),req.expected_guests,stamp()))
+  c.execute('INSERT INTO bookings(id,date,start,end,requested_room,requested_room2,status,invite_hash,organizer_id,loyal_organizer,expected_guests,pricing_version,extra_food_packages,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+ (bid,req.date,req.time,end,preferred,preferred2,'planning',hsh(invite),member_id,int(req.loyal),req.expected_guests,2,req.extra_food_packages,stamp()))
   c.execute('INSERT INTO members(id,booking_id,name,email,auth_hash,organizer,loyal,created_at) VALUES (?,?,?,?,?,?,?,?)',
  (member_id,bid,req.name.strip(),req.email.strip(),hsh(token),1,int(req.loyal),stamp()))
+  if req.loyal:redeem_reward(c,req.reward_code,bid,member_id)
  return {'booking_id':bid,'member_id':member_id,'member_token':token,'invite_url':f'{ORIGIN}/?invite={urllib.parse.quote(invite)}&booking={urllib.parse.quote(bid)}','invite_token':invite,'booking':{'date':req.date,'time':req.time,'end':end}}
 @app.post('/api/bookings/{bid}/join')
 def join(bid:str,req:Join):
@@ -261,9 +350,11 @@ def join(bid:str,req:Join):
   b=booking(c,bid);can_edit(b)
   if not hmac.compare_digest(b['invite_hash'],hsh(req.invite)):fail(403,'This invitation link is invalid.')
   count=c.execute('SELECT COUNT(*) c FROM members WHERE booking_id=?',(bid,)).fetchone()['c']
-  if count>=min(CAPACITY,b['expected_guests']):fail(409,'Your planned guest count is full. Ask the organizer to increase the number of guests in My group before inviting more people.')
+  limit=CAPACITY if b['pricing_version']==1 else MAX_CAPACITY
+  if count>=min(limit,b['expected_guests']):fail(409,'Your planned guest count is full. Ask the organizer to increase the number of guests in My group before inviting more people.')
   c.execute('INSERT INTO members(id,booking_id,name,email,auth_hash,organizer,loyal,created_at) VALUES (?,?,?,?,?,?,?,?)',
  (member_id,bid,req.name.strip(),req.email,hsh(token),0,int(req.loyal),stamp()))
+  if req.loyal:redeem_reward(c,req.reward_code,bid,member_id)
  return {'booking_id':bid,'member_id':member_id,'member_token':token}
 @app.get('/api/bookings/{bid}')
 def get_book(bid:str,authorization:Optional[str]=Header(None)):
@@ -288,14 +379,17 @@ def set_guest_count(bid:str,req:GuestPlan,authorization:Optional[str]=Header(Non
   b=booking(c,bid);can_edit(b)
   count=c.execute('SELECT COUNT(*) c FROM members WHERE booking_id=?',(bid,)).fetchone()['c']
   if req.expected_guests<count:fail(422,'The planned guest count cannot be smaller than the number already joined.')
-  c.execute('UPDATE bookings SET expected_guests=? WHERE id=?',(req.expected_guests,bid))
+  if b['pricing_version']==1 and req.expected_guests>8:fail(422,'This earlier booking supports up to 8 guests. Create a new booking for a combined room.')
+  crossing=(b['expected_guests']<=8)!=(req.expected_guests<=8)
+  c.execute('UPDATE bookings SET expected_guests=?,requested_room=CASE WHEN ? THEN NULL ELSE requested_room END,requested_room2=CASE WHEN ? THEN NULL ELSE requested_room2 END WHERE id=?',(req.expected_guests,int(crossing),int(crossing),bid))
   return public_view(c,bid)
 @app.post('/api/bookings/{bid}/room')
 def set_room(bid:str,req:Room,authorization:Optional[str]=Header(None)):
  person=auth(bid,authorization);organizer(person)
  with transaction() as c:
   b=booking(c,bid);can_edit(b)
-  c.execute('UPDATE bookings SET requested_room=? WHERE id=?',(req.room,bid))
+  room,room2=normalize_room(req.room,b['expected_guests'])
+  c.execute('UPDATE bookings SET requested_room=?,requested_room2=? WHERE id=?',(room,room2,bid))
   return public_view(c,bid)
 @app.post('/api/bookings/{bid}/items')
 def add_item(bid:str,req:AddItem,authorization:Optional[str]=Header(None)):
@@ -332,13 +426,17 @@ def checkout(bid:str,req:Split,authorization:Optional[str]=Header(None)):
  with transaction() as c:
   b=booking(c,bid);can_edit(b)
   members,items,_=rows_for(c,bid)
+  if b['pricing_version']>=2 and b['expected_guests']>8 and len(members)<9:
+   fail(409,'A combined room needs at least 9 joined guests. Invite more people or reduce the planned group size.')
   bill=calc_bill(b,members,items);alloc=allocations(b,members,items,bill,req)
-  free=available(c,b['date'],b['start'],b['end'],exclude=bid)
-  room=b['requested_room'] or (free[0] if free else None)
-  if room not in free:fail(409,'Selected room is unavailable. Please choose another room or time.')
+  free=available(c,b['date'],b['start'],b['end'],b['expected_guests'],exclude=bid)
+  preferred=room_key(b['requested_room'],b['requested_room2']) if b['requested_room'] else None
+  chosen=preferred or (free[0] if free else None)
+  if chosen not in free:fail(409,'Selected room is unavailable. Choose another available time or date.')
+  room,room2=normalize_room(chosen,b['expected_guests'])
   hold=(utc()+dt.timedelta(minutes=HOLD_MINS)).isoformat()
-  c.execute("UPDATE bookings SET locked=1,status='held',room=?,hold_until=?,split_mode=? WHERE id=?",
- (room,hold,req.mode,bid))
+  c.execute("UPDATE bookings SET locked=1,status='held',room=?,room2=?,hold_until=?,split_mode=? WHERE id=?",
+ (room,room2,hold,req.mode,bid))
   for mid,amount in alloc.items():
    c.execute('INSERT INTO charges(id,booking_id,member_id,amount_cents,status) VALUES (?,?,?,?,?)',
  (uid('PAY'),bid,mid,amount,'unpaid' if amount>0 else 'paid'))
@@ -434,7 +532,7 @@ async def stripe_webhook(request:Request,stripe_signature:Optional[str]=Header(N
 
 # Authenticated booking QR: holds a signed reference, not a person or payment secret.
 def qr_token(b):
- value={'bid':b['id'],'room':b['room'],'date':b['date'],'start':b['start'],'end':b['end']}
+ value={'bid':b['id'],'room':b['room'],'room2':b['room2'],'date':b['date'],'start':b['start'],'end':b['end']}
  raw=json.dumps(value,separators=(',',':')).encode()
  part=base64.urlsafe_b64encode(raw).rstrip(b'=').decode();sig=hmac.new(SECRET.encode(),part.encode(),hashlib.sha256).hexdigest()
  return part+'.'+sig
@@ -449,9 +547,9 @@ def verify_qr(token):
  with conn() as c:
   b=booking(c,payload['bid'])
  if b['status']!='confirmed':fail(409,'Booking has not been fully paid.')
- for k,v in [('room','room'),('date','date'),('start','start'),('end','end')]:
+ for k,v in [('room','room'),('room2','room2'),('date','date'),('start','start'),('end','end')]:
   if payload.get(k)!=b[v]:fail(409,'Booking QR details do not match the reservation.')
- return {'valid':True,'booking_id':b['id'],'room':b['room'],'date':b['date'],'time':b['start'],'end':b['end'],'status':b['status']}
+ return {'valid':True,'booking_id':b['id'],'room':b['room'],'room2':b['room2'],'room_name':room_name(b['room'],b['room2']),'date':b['date'],'time':b['start'],'end':b['end'],'status':b['status']}
 
 def qrcode_bytes(text):
  img=qrcode.QRCode(version=None,error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=2);img.add_data(text);img.make(fit=True)
@@ -468,6 +566,15 @@ def checkin_page():return FileResponse(ROOT/'static'/'staff.html')
 def staff_verify(req:StaffVerification,x_staff_pin:Optional[str]=Header(None)):
  if not STAFF_PIN or not hmac.compare_digest(x_staff_pin or '',STAFF_PIN):fail(403,'Staff verification PIN required.')
  return verify_qr(req.token)
+
+@app.post('/api/staff/loyalty/rewards')
+def issue_demo_reward(x_staff_pin:Optional[str]=Header(None)):
+ if not DEMO:fail(404,'Demo rewards are unavailable.')
+ if not STAFF_PIN or not hmac.compare_digest(x_staff_pin or '',STAFF_PIN):fail(403,'Staff verification PIN required.')
+ code=secrets.token_urlsafe(18)
+ with transaction() as c:
+  c.execute('INSERT INTO loyalty_rewards(code_hash,issued_at) VALUES (?,?)',(hsh(code),stamp()))
+ return {'reward_code':code,'one_time':True}
 
 # Reportlab A4 invoice/receipt builder. Demo payments are always clearly watermarked.
 def pdf_invoice(bid, mid=None):
@@ -497,7 +604,7 @@ def pdf_invoice(bid, mid=None):
  label('Invoice number',('RCPT-' if mid else 'INV-')+bid+(('-'+mid[-5:]) if mid else ''))
  label('Issued at',utc().strftime('%d %b %Y %H:%M UTC'))
  label('Session',f"{b['date']}  {b['start']} - {b['end']}")
- label('Room',f"ROOM {b['room']:02d}  /  PAID & CONFIRMED")
+ label('Room',room_name(b['room'],b['room2'])+'  /  PAID & CONFIRMED')
  if payer:
   label('Guest',payer['name']);label('Guest email',payer['email'] or 'Not provided')
  else:
@@ -518,12 +625,24 @@ def pdf_invoice(bid, mid=None):
   cv.setFont('Helvetica-Oblique',8);cv.drawString(44,y,'The consolidated invoice contains all group line items.');y-=18
   gross=charge['amount_cents']
  else:
-  for member in members:
-   line(f"Studio seat — {member['name']}"+(' (10-stamp reward)' if member['loyal'] else ''),1,LOYALTY if member['loyal'] else BASE)
-  if bill['room_fee_cents']:line('Private studio reservation',1,ROOM_FEE)
-  else:line('Private studio reservation (loyalty benefit)',1,0)
+  if b['pricing_version']>=2:
+   for index in range(0,len(members),2):
+    pair=members[index:index+2]
+    discounted=any(m['loyal'] for m in pair)
+    line('Duo Package '+str(index//2+1)+(' (10-stamp reward)' if discounted else ''),1,LOYAL_DUO_PRICE if discounted else DUO_PRICE)
+   if b['extra_food_packages']:
+    line('Optional extra-food package',b['extra_food_packages'],b['extra_food_packages']*EXTRA_FOOD_PRICE)
+  else:
+   for member in members:
+    line(f"Studio seat — {member['name']}"+(' (10-stamp reward)' if member['loyal'] else ''),1,LOYALTY if member['loyal'] else BASE)
+   if bill['room_fee_cents']:line('Private studio reservation',1,ROOM_FEE)
+   else:line('Private studio reservation (loyalty benefit)',1,0)
+  item_costs=menu_charges(members,items,b['pricing_version'])
   for item in items:
-   line(MENUD[item['product_id']]['name']+('  (shared)' if item['shared'] else ''),item['qty'],item['qty']*item['unit_cents'])
+   label=MENUD[item['product_id']]['name']+('  (shared)' if item['shared'] else '')
+   cost=item_costs[item['id']]
+   if cost['included_qty']:line(label+' — included in Duo',cost['included_qty'],0)
+   if cost['billable_qty']:line(label,cost['billable_qty'],cost['billable_cents'])
   gross=bill['total_cents']
  if bill['loyalty_savings_cents']:
   cv.setFont('Helvetica-Oblique',9);cv.setFillColor(HexColor('#27805a'))
